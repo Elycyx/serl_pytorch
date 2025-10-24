@@ -1,113 +1,166 @@
 import pickle as pkl
-import jax
-from jax import numpy as jnp
-import flax.linen as nn
-from flax.training.train_state import TrainState
-from flax.training import checkpoints
-import optax
 from typing import Callable, Dict, List, Optional
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from serl_launcher.vision.resnet_v1 import resnetv1_configs, PreTrainedResNetEncoder
-from serl_launcher.common.encoding import EncodingWrapper
-from flax.core.frozen_dict import freeze, unfreeze
+# Note: These imports will be converted later
+# from serl_launcher.vision.resnet_v1 import resnetv1_configs, PreTrainedResNetEncoder
+# from serl_launcher.common.encoding import EncodingWrapper
 
 
 class BinaryClassifier(nn.Module):
-    encoder_def: nn.Module
-    hidden_dim: int = 256
-
-    @nn.compact
-    def __call__(self, x, train=False):
+    """
+    Binary classifier for reward prediction.
+    
+    Args:
+        encoder_def: Encoder network
+        hidden_dim: Hidden dimension for classification head
+    """
+    
+    def __init__(self, encoder_def: nn.Module, hidden_dim: int = 256):
+        super().__init__()
+        self.encoder_def = encoder_def
+        self.hidden_dim = hidden_dim
+        
+        # Layers will be created lazily after first forward pass
+        self.dense = None
+        self.dropout = nn.Dropout(0.1)
+        self.layer_norm = None
+        self.output_layer = None
+    
+    def forward(self, x: torch.Tensor, train: bool = False) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            x: Input observations
+            train: Whether in training mode
+            
+        Returns:
+            Classification logits
+        """
         x = self.encoder_def(x, train=train)
-        x = nn.Dense(self.hidden_dim)(x)
-        x = nn.Dropout(0.1)(x, deterministic=not train)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        x = nn.Dense(1)(x)
+        
+        # Lazy initialization
+        if self.dense is None:
+            self.dense = nn.Linear(x.shape[-1], self.hidden_dim).to(x.device)
+            self.layer_norm = nn.LayerNorm(self.hidden_dim).to(x.device)
+            self.output_layer = nn.Linear(self.hidden_dim, 1).to(x.device)
+        
+        x = self.dense(x)
+        x = self.dropout(x) if train else x
+        x = self.layer_norm(x)
+        x = F.relu(x)
+        x = self.output_layer(x)
+        
         return x
 
 
 def create_classifier(
-    key: jnp.ndarray,
     sample: Dict,
     image_keys: List[str],
     pretrained_encoder_path: str = "./resnet10_params.pkl",
+    device: torch.device = None,
 ):
-    pretrained_encoder = resnetv1_configs["resnetv1-10-frozen"](
-        pre_pooling=True,
-        name="pretrained_encoder",
+    """
+    Create a binary classifier with pretrained encoder.
+    
+    Args:
+        sample: Sample observation dictionary
+        image_keys: List of image keys in observations
+        pretrained_encoder_path: Path to pretrained encoder weights
+        device: Device to place model on
+        
+    Returns:
+        Classifier model with loaded weights
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # NOTE: This is a placeholder implementation
+    # The actual implementation will be completed when vision modules are converted
+    raise NotImplementedError(
+        "create_classifier will be implemented after vision modules are converted. "
+        "This requires ResNetV1 and EncodingWrapper to be converted to PyTorch first."
     )
-    encoders = {
-        image_key: PreTrainedResNetEncoder(
-            pooling_method="spatial_learned_embeddings",
-            num_spatial_blocks=8,
-            bottleneck_dim=256,
-            pretrained_encoder=pretrained_encoder,
-            name=f"encoder_{image_key}",
-        )
-        for image_key in image_keys
-    }
-    encoder_def = EncodingWrapper(
-        encoder=encoders,
-        use_proprio=False,
-        enable_stacking=True,
-        image_keys=image_keys,
-    )
-
-    classifier_def = BinaryClassifier(encoder_def=encoder_def)
-    params = classifier_def.init(key, sample)["params"]
-    classifier_def = BinaryClassifier(encoder_def=encoder_def)
-    params = freeze(params)
-    classifier = TrainState.create(
-        apply_fn=classifier_def.apply,
-        params=params,
-        tx=optax.adam(learning_rate=1e-4),
-    )
-
-    with open(pretrained_encoder_path, "rb") as f:
-        encoder_params = pkl.load(f)
-    param_count = sum(x.size for x in jax.tree_leaves(encoder_params))
-    print(
-        f"Loaded {param_count/1e6}M parameters from ResNet-10 pretrained on ImageNet-1K"
-    )
-
-    new_params = classifier.params.unfreeze()
-    for image_key in image_keys:
-        if "pretrained_encoder" in new_params["encoder_def"][f"encoder_{image_key}"]:
-            for k in new_params["encoder_def"][f"encoder_{image_key}"][
-                "pretrained_encoder"
-            ]:
-                if k in encoder_params:
-                    new_params["encoder_def"][f"encoder_{image_key}"][
-                        "pretrained_encoder"
-                    ][k] = encoder_params[k]
-                    print(f"replaced {k} in encoder_{image_key}")
-
-    new_params = freeze(new_params)
-    classifier = classifier.replace(params=new_params)
-    return classifier
+    
+    # The actual implementation would look like:
+    # pretrained_encoder = resnetv1_configs["resnetv1-10-frozen"](
+    #     pre_pooling=True,
+    #     name="pretrained_encoder",
+    # )
+    # encoders = {
+    #     image_key: PreTrainedResNetEncoder(
+    #         pooling_method="spatial_learned_embeddings",
+    #         num_spatial_blocks=8,
+    #         bottleneck_dim=256,
+    #         pretrained_encoder=pretrained_encoder,
+    #     )
+    #     for image_key in image_keys
+    # }
+    # encoder_def = EncodingWrapper(
+    #     encoder=encoders,
+    #     use_proprio=False,
+    #     enable_stacking=True,
+    #     image_keys=image_keys,
+    # )
+    # 
+    # classifier = BinaryClassifier(encoder_def=encoder_def)
+    # classifier = classifier.to(device)
+    # 
+    # # Load pretrained weights
+    # if pretrained_encoder_path:
+    #     with open(pretrained_encoder_path, "rb") as f:
+    #         encoder_params = pkl.load(f)
+    #     # Load weights into classifier
+    #     # ... (conversion from JAX params to PyTorch state dict)
+    # 
+    # return classifier
 
 
 def load_classifier_func(
-    key: jnp.ndarray,
     sample: Dict,
     image_keys: List[str],
     checkpoint_path: str,
     step: Optional[int] = None,
-) -> Callable[[Dict], jnp.ndarray]:
+    device: torch.device = None,
+) -> Callable[[Dict], torch.Tensor]:
     """
-    Return: a function that takes in an observation
-            and returns the logits of the classifier.
+    Load a classifier and return a function that computes logits.
+    
+    Args:
+        sample: Sample observation dictionary
+        image_keys: List of image keys in observations
+        checkpoint_path: Path to checkpoint directory
+        step: Optional specific step to load
+        device: Device to place model on
+        
+    Returns:
+        Function that takes observations and returns classification logits
     """
-    classifier = create_classifier(key, sample, image_keys)
-    classifier = checkpoints.restore_checkpoint(
-        checkpoint_path,
-        target=classifier,
-        step=step,
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # NOTE: This is a placeholder implementation
+    raise NotImplementedError(
+        "load_classifier_func will be implemented after vision modules are converted."
     )
-    func = lambda obs: classifier.apply_fn(
-        {"params": classifier.params}, obs, train=False
-    )
-    func = jax.jit(func)
-    return func
+    
+    # The actual implementation would look like:
+    # classifier = create_classifier(sample, image_keys, device=device)
+    # 
+    # # Load checkpoint
+    # checkpoint = torch.load(f"{checkpoint_path}/checkpoint_{step}.pt", map_location=device)
+    # classifier.load_state_dict(checkpoint['model_state_dict'])
+    # 
+    # classifier.eval()
+    # 
+    # @torch.no_grad()
+    # def func(obs):
+    #     # Convert observations to tensors if needed
+    #     obs_tensor = {k: torch.as_tensor(v, device=device) for k, v in obs.items()}
+    #     return classifier(obs_tensor, train=False)
+    # 
+    # return func

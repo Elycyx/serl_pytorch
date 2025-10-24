@@ -1,230 +1,319 @@
+"""
+Behavioral Cloning (BC) agent implementation in PyTorch.
+
+BC is a simple imitation learning algorithm that trains a policy
+to match expert demonstrations using supervised learning.
+"""
+
 from functools import partial
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
-import flax
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
 import numpy as np
-import optax
-from flax.core import FrozenDict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from serl_launcher.common.common import JaxRLTrainState, ModuleDict, nonpytree_field
+from serl_launcher.common.common import TorchRLTrainState, ModuleDict
 from serl_launcher.common.encoding import EncodingWrapper
-from serl_launcher.common.typing import Batch, PRNGKey
+from serl_launcher.common.typing import Batch, PRNGKey, Data
 from serl_launcher.networks.actor_critic_nets import Policy
 from serl_launcher.networks.mlp import MLP
 from serl_launcher.utils.train_utils import _unpack
 from serl_launcher.vision.data_augmentations import batched_random_crop
+from serl_launcher.utils.torch_utils import next_rng
 
 
-class BCAgent(flax.struct.PyTreeNode):
-    state: JaxRLTrainState
-    config: dict = nonpytree_field()
-
-    def data_augmentation_fn(self, rng, observations):
-        for pixel_key in self.config["image_keys"]:
-            observations = observations.copy(
-                add_or_replace={
-                    pixel_key: batched_random_crop(
-                        observations[pixel_key], rng, padding=4, num_batch_dims=2
-                    )
-                }
-            )
-        return observations
-
-    @partial(jax.jit, static_argnames="pmap_axis")
-    def update(self, batch: Batch, pmap_axis: str = None):
+class BCAgent:
+    """
+    Behavioral Cloning agent.
+    
+    Trains a policy to match expert demonstrations using supervised learning
+    (negative log-likelihood loss).
+    """
+    
+    def __init__(self, state: TorchRLTrainState, config: dict):
+        """
+        Initialize BC agent.
+        
+        Args:
+            state: Training state
+            config: Configuration dict
+        """
+        self.state = state
+        self.config = config
+    
+    def data_augmentation_fn(
+        self,
+        observations: Data,
+        generator: Optional[torch.Generator] = None,
+    ) -> Data:
+        """
+        Apply data augmentation (random crop) to observations.
+        
+        Args:
+            observations: Observations dict
+            generator: Random generator
+            
+        Returns:
+            Augmented observations
+        """
+        augmented_obs = {}
+        for key, value in observations.items():
+            if key in self.config["image_keys"]:
+                # Apply random crop augmentation
+                augmented_obs[key] = batched_random_crop(
+                    value,
+                    padding=4,
+                    generator=generator,
+                )
+            else:
+                augmented_obs[key] = value
+        
+        return augmented_obs
+    
+    def update(
+        self,
+        batch: Batch,
+        pmap_axis: Optional[str] = None,
+    ) -> Tuple["BCAgent", Dict[str, Any]]:
+        """
+        Update the policy using behavioral cloning.
+        
+        Args:
+            batch: Training batch with observations and expert actions
+            pmap_axis: Parallel axis (not used in single-GPU PyTorch)
+            
+        Returns:
+            Updated agent and info dict
+        """
+        # Unpack batch if necessary
         if self.config["image_keys"][0] not in batch["next_observations"]:
             batch = _unpack(batch)
-
-        # rng = self.state.rng
-        # rng, obs_rng, next_obs_rng = jax.random.split(rng, 3)
-        # obs = self.data_augmentation_fn(obs_rng, batch["observations"])
-        # batch = batch.copy(add_or_replace={"observations": obs})
-
-        def loss_fn(params, rng):
-            rng, key = jax.random.split(rng)
-            dist = self.state.apply_fn(
-                {"params": params},
-                batch["observations"],
-                temperature=1.0,
-                train=True,
-                rngs={"dropout": key},
-                name="actor",
-            )
-            pi_actions = dist.mode()
-            log_probs = dist.log_prob(batch["actions"])
-            mse = ((pi_actions - batch["actions"]) ** 2).sum(-1)
-            actor_loss = -(log_probs).mean()
-            actor_std = dist.stddev().mean(axis=1)
-
-            return actor_loss, {
-                "actor_loss": actor_loss,
-                "mse": mse.mean(),
-                # "log_probs": log_probs,
-                # "pi_actions": pi_actions,
-                # "mean_std": actor_std.mean(),
-                # "max_std": actor_std.max(),
-            }
-
-        # compute gradients and update params
-        new_state, info = self.state.apply_loss_fns(
-            loss_fn, pmap_axis=pmap_axis, has_aux=True
+        
+        # Optional: Apply data augmentation (currently commented out in original)
+        # obs_generator = next_rng()
+        # obs = self.data_augmentation_fn(batch["observations"], obs_generator)
+        # batch = {**batch, "observations": obs}
+        
+        # Zero gradients
+        self.state.optimizers["actor"].zero_grad()
+        
+        # Forward pass through policy
+        dist = self.state.models["actor"](
+            batch["observations"],
+            temperature=1.0,
+            train=True,
         )
-
-        return self.replace(state=new_state), info
-
-    @partial(jax.jit, static_argnames="argmax")
+        
+        # Policy actions (mode)
+        pi_actions = dist.mean  # For Gaussian, mean is the mode
+        
+        # Log probabilities of expert actions
+        log_probs = dist.log_prob(batch["actions"])
+        
+        # MSE loss (for monitoring)
+        mse = ((pi_actions - batch["actions"]) ** 2).sum(dim=-1)
+        
+        # Behavioral cloning loss: negative log-likelihood
+        actor_loss = -log_probs.mean()
+        
+        # Backward pass
+        actor_loss.backward()
+        
+        # Update parameters
+        self.state.optimizers["actor"].step()
+        
+        # Increment step
+        self.state.step += 1
+        
+        # Collect info
+        info = {
+            "actor_loss": actor_loss.item(),
+            "mse": mse.mean().item(),
+        }
+        
+        return self, info
+    
     def sample_actions(
         self,
-        observations: np.ndarray,
+        observations: Data,
         *,
         seed: Optional[PRNGKey] = None,
         temperature: float = 1.0,
-        argmax=False,
-    ) -> jnp.ndarray:
-        dist = self.state.apply_fn(
-            {"params": self.state.params},
-            observations,
-            temperature=temperature,
-            name="actor",
-        )
-        if argmax:
-            actions = dist.mode()
-        else:
-            actions = dist.sample(seed=seed)
+        argmax: bool = False,
+    ) -> torch.Tensor:
+        """
+        Sample actions from the policy.
+        
+        Args:
+            observations: Observations
+            seed: Random seed (generator)
+            temperature: Temperature for sampling
+            argmax: If True, return mode (deterministic)
+            
+        Returns:
+            Sampled actions
+        """
+        with torch.no_grad():
+            dist = self.state.models["actor"](
+                observations,
+                temperature=temperature,
+                train=False,
+            )
+            
+            if argmax:
+                actions = dist.mean  # Deterministic mode
+            else:
+                if seed is not None and isinstance(seed, torch.Generator):
+                    # Sample with specific generator (for reproducibility)
+                    actions = dist.sample()
+                else:
+                    actions = dist.sample()
+        
         return actions
-
-    @jax.jit
-    def get_debug_metrics(self, batch, **kwargs):
-        dist = self.state.apply_fn(
-            {"params": self.state.params},
-            batch["observations"],
-            temperature=1.0,
-            name="actor",
-        )
-        pi_actions = dist.mode()
-        log_probs = dist.log_prob(batch["actions"])
-        mse = ((pi_actions - batch["actions"]) ** 2).sum(-1)
-
+    
+    def get_debug_metrics(self, batch: Batch, **kwargs) -> Dict[str, torch.Tensor]:
+        """
+        Get debug metrics for monitoring.
+        
+        Args:
+            batch: Training batch
+            **kwargs: Additional arguments
+            
+        Returns:
+            Dict of debug metrics
+        """
+        with torch.no_grad():
+            dist = self.state.models["actor"](
+                batch["observations"],
+                temperature=1.0,
+                train=False,
+            )
+            pi_actions = dist.mean
+            log_probs = dist.log_prob(batch["actions"])
+            mse = ((pi_actions - batch["actions"]) ** 2).sum(dim=-1)
+        
         return {
             "mse": mse,
             "log_probs": log_probs,
             "pi_actions": pi_actions,
         }
-
+    
     @classmethod
     def create(
         cls,
         rng: PRNGKey,
-        observations: FrozenDict,
-        actions: jnp.ndarray,
+        observations: Data,
+        actions: torch.Tensor,
         # Model architecture
         encoder_type: str = "small",
         image_keys: Iterable[str] = ("image",),
         use_proprio: bool = False,
-        network_kwargs: dict = {
-            "hidden_dims": [256, 256],
-        },
-        policy_kwargs: dict = {
-            "tanh_squash_distribution": False,
-        },
+        network_kwargs: Dict = None,
+        policy_kwargs: Dict = None,
         # Optimizer
         learning_rate: float = 3e-4,
+        device: str = "cpu",
     ):
+        """
+        Create a new BC agent.
+        
+        Args:
+            rng: Random generator
+            observations: Sample observations
+            actions: Sample actions
+            encoder_type: Type of encoder ('small', 'resnet', 'resnet-pretrained')
+            image_keys: Keys for image observations
+            use_proprio: Whether to use proprioception
+            network_kwargs: MLP config for policy
+            policy_kwargs: Policy config
+            learning_rate: Learning rate
+            device: Device to use
+            
+        Returns:
+            BCAgent instance
+        """
+        # Default kwargs
+        if network_kwargs is None:
+            network_kwargs = {"hidden_dims": [256, 256]}
+        if policy_kwargs is None:
+            policy_kwargs = {"tanh_squash_distribution": False}
+        
+        # Create encoder
         if encoder_type == "small":
             from serl_launcher.vision.small_encoders import SmallEncoder
-
-            encoders = {
+            
+            encoders = nn.ModuleDict({
                 image_key: SmallEncoder(
                     features=(32, 64, 128, 256),
                     kernel_sizes=(3, 3, 3, 3),
                     strides=(2, 2, 2, 2),
-                    padding="VALID",
+                    padding="valid",
                     pool_method="avg",
                     bottleneck_dim=256,
                     spatial_block_size=8,
-                    name=f"encoder_{image_key}",
                 )
                 for image_key in image_keys
-            }
+            })
         elif encoder_type == "resnet":
-            from serl_launcher.vision.resnet_v1 import resnetv1_configs
-
-            encoders = {
-                image_key: resnetv1_configs["resnetv1-10"](
-                    pooling_method="spatial_learned_embeddings",
-                    num_spatial_blocks=8,
-                    bottleneck_dim=256,
-                    name=f"encoder_{image_key}",
-                )
-                for image_key in image_keys
-            }
+            # ResNet encoder placeholder
+            raise NotImplementedError("ResNet encoder not yet implemented for PyTorch")
         elif encoder_type == "resnet-pretrained":
-            from serl_launcher.vision.resnet_v1 import (
-                PreTrainedResNetEncoder,
-                resnetv1_configs,
-            )
-
-            pretrained_encoder = resnetv1_configs["resnetv1-10-frozen"](
-                pre_pooling=True,
-                name="pretrained_encoder",
-            )
-            encoders = {
-                image_key: PreTrainedResNetEncoder(
-                    pooling_method="spatial_learned_embeddings",
-                    num_spatial_blocks=8,
-                    bottleneck_dim=256,
-                    pretrained_encoder=pretrained_encoder,
-                    name=f"encoder_{image_key}",
-                )
-                for image_key in image_keys
-            }
+            # Pretrained ResNet encoder placeholder
+            raise NotImplementedError("Pretrained ResNet encoder not yet implemented for PyTorch")
         else:
             raise NotImplementedError(f"Unknown encoder type: {encoder_type}")
-
+        
+        # Create encoding wrapper
         encoder_def = EncodingWrapper(
             encoder=encoders,
             use_proprio=use_proprio,
             enable_stacking=True,
             image_keys=image_keys,
+        ).to(device)
+        
+        # Move observations to device
+        observations = torch.tree_map(
+            lambda x: x.to(device) if isinstance(x, torch.Tensor) else x,
+            observations
         )
-
+        actions = actions.to(device)
+        
+        # Create policy network
         network_kwargs["activate_final"] = True
-        networks = {
-            "actor": Policy(
-                encoder_def,
-                MLP(**network_kwargs),
-                action_dim=actions.shape[-1],
-                **policy_kwargs,
-            )
-        }
-
-        model_def = ModuleDict(networks)
-
-        tx = optax.adam(learning_rate)
-
-        rng, init_rng = jax.random.split(rng)
-        params = model_def.init(init_rng, actor=[observations])["params"]
-
-        rng, create_rng = jax.random.split(rng)
-        state = JaxRLTrainState.create(
-            apply_fn=model_def.apply,
-            params=params,
-            txs=tx,
-            target_params=params,
-            rng=create_rng,
+        actor_def = Policy(
+            encoder=encoder_def,
+            network=MLP(**network_kwargs),
+            action_dim=actions.shape[-1],
+            **policy_kwargs,
+        ).to(device)
+        
+        networks = {"actor": actor_def}
+        model_dict = ModuleDict(networks)
+        
+        # Create optimizer
+        optimizer = torch.optim.Adam(actor_def.parameters(), lr=learning_rate)
+        optimizers = {"actor": optimizer}
+        
+        # Create train state
+        state = TorchRLTrainState.create(
+            apply_fn=model_dict.forward,
+            models=networks,
+            optimizers=optimizers,
+            rng=rng,
+            target_models=None,  # BC doesn't use target networks
         )
+        
         config = dict(
             image_keys=image_keys,
         )
-
+        
         agent = cls(state, config)
-
-        if encoder_type == "resnet-pretrained":  # load pretrained weights for ResNet-10
-            from serl_launcher.utils.train_utils import load_resnet10_params
-
-            agent = load_resnet10_params(agent, image_keys)
-
+        
+        if encoder_type == "resnet-pretrained":
+            # Load pretrained weights for ResNet-10
+            # from serl_launcher.utils.train_utils import load_resnet10_params
+            # agent = load_resnet10_params(agent, image_keys)
+            raise NotImplementedError("Pretrained ResNet loading not yet implemented")
+        
         return agent

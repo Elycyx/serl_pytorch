@@ -1,83 +1,127 @@
 from functools import partial
-from typing import Callable, Optional, Sequence
+from typing import Optional, Sequence
 
-import chex
-import flax.linen as nn
-import jax.numpy as jnp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class LagrangeMultiplier(nn.Module):
-    init_value: float = 1.0
-    constraint_shape: Sequence[int] = ()
-    constraint_type: str = "eq"  # One of ("eq", "leq", "geq")
-    parameterization: Optional[
-        str
-    ] = None  # One of ("softplus", "exp"), or None for equality constraints
-
-    @nn.compact
-    def __call__(
-        self, *, lhs: Optional[jnp.ndarray] = None, rhs: Optional[jnp.ndarray] = None
-    ) -> jnp.ndarray:
-        init_value = self.init_value
-
-        if self.constraint_type != "eq":
-            assert (
-                init_value > 0
-            ), "Inequality constraints must have non-negative initial multiplier values"
-
-            if self.parameterization == "softplus":
-                init_value = jnp.log(jnp.exp(init_value) - 1)
-            elif self.parameterization == "exp":
-                init_value = jnp.log(init_value)
+    """
+    Lagrange multiplier for constrained optimization.
+    
+    Args:
+        init_value: Initial value of the multiplier
+        constraint_shape: Shape of the constraint
+        constraint_type: Type of constraint ("eq", "leq", "geq")
+        parameterization: Parameterization method ("softplus", "exp"), or None for equality
+    """
+    
+    def __init__(
+        self,
+        init_value: float = 1.0,
+        constraint_shape: Sequence[int] = (),
+        constraint_type: str = "eq",  # One of ("eq", "leq", "geq")
+        parameterization: Optional[str] = None,  # One of ("softplus", "exp"), or None
+    ):
+        super().__init__()
+        self.constraint_type = constraint_type
+        self.parameterization = parameterization
+        self.constraint_shape = constraint_shape
+        
+        # Validate inputs
+        if constraint_type != "eq":
+            assert init_value > 0, \
+                "Inequality constraints must have non-negative initial multiplier values"
+            
+            if parameterization == "softplus":
+                # Inverse softplus: softplus^{-1}(x) = log(exp(x) - 1)
+                init_value = torch.log(torch.exp(torch.tensor(init_value)) - 1).item()
+            elif parameterization == "exp":
+                init_value = torch.log(torch.tensor(init_value)).item()
             else:
-                raise ValueError(
-                    f"Invalid multiplier parameterization {self.parameterization}"
-                )
+                raise ValueError(f"Invalid multiplier parameterization {parameterization}")
         else:
-            assert (
-                self.parameterization is None
-            ), "Equality constraints must have no parameterization"
-
-        multiplier = self.param(
-            "lagrange",
-            lambda _, shape: jnp.full(shape, init_value),
-            self.constraint_shape,
+            assert parameterization is None, \
+                "Equality constraints must have no parameterization"
+        
+        # Create parameter
+        if constraint_shape == () or len(constraint_shape) == 0:
+            shape = (1,)
+        else:
+            shape = constraint_shape
+        
+        self.multiplier = nn.Parameter(
+            torch.full(shape, init_value, dtype=torch.float32)
         )
-
+    
+    def forward(
+        self,
+        lhs: Optional[torch.Tensor] = None,
+        rhs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute Lagrange penalty.
+        
+        Args:
+            lhs: Left-hand side of constraint
+            rhs: Right-hand side of constraint (default 0)
+            
+        Returns:
+            If lhs is None, returns the raw multiplier.
+            Otherwise, returns the Lagrange penalty.
+        """
+        multiplier = self.multiplier
+        
+        # Apply parameterization if needed
         if self.constraint_type != "eq":
             if self.parameterization == "softplus":
-                multiplier = nn.softplus(multiplier)
+                multiplier = F.softplus(multiplier)
             elif self.parameterization == "exp":
-                multiplier = jnp.exp(multiplier)
+                multiplier = torch.exp(multiplier)
             else:
-                raise ValueError(
-                    f"Invalid multiplier parameterization {self.parameterization}"
-                )
-
-        # Return the raw multiplier
+                raise ValueError(f"Invalid multiplier parameterization {self.parameterization}")
+        
+        # Return raw multiplier if no constraint provided
         if lhs is None:
             return multiplier
-
-        # Use the multiplier to compute the Lagrange penalty
+        
+        # Compute Lagrange penalty
         if rhs is None:
-            rhs = jnp.zeros_like(lhs)
-
+            rhs = torch.zeros_like(lhs)
+        
         diff = lhs - rhs
-
-        chex.assert_equal_shape([diff, multiplier])
-
+        
+        # Check shapes match
+        assert diff.shape == multiplier.shape or multiplier.numel() == 1, \
+            f"Shape mismatch: diff {diff.shape} vs multiplier {multiplier.shape}"
+        
         if self.constraint_type == "eq":
             return multiplier * diff
         elif self.constraint_type == "geq":
             return multiplier * diff
         elif self.constraint_type == "leq":
             return -multiplier * diff
+        else:
+            raise ValueError(f"Invalid constraint type {self.constraint_type}")
 
 
-GeqLagrangeMultiplier = partial(
-    LagrangeMultiplier, constraint_type="geq", parameterization="softplus"
-)
+# Convenience functions for common constraint types
+def GeqLagrangeMultiplier(init_value: float = 1.0, constraint_shape: Sequence[int] = ()):
+    """Greater-or-equal constraint Lagrange multiplier."""
+    return LagrangeMultiplier(
+        init_value=init_value,
+        constraint_shape=constraint_shape,
+        constraint_type="geq",
+        parameterization="softplus"
+    )
 
-LeqLagrangeMultiplier = partial(
-    LagrangeMultiplier, constraint_type="leq", parametrization="softplus"
-)
+
+def LeqLagrangeMultiplier(init_value: float = 1.0, constraint_shape: Sequence[int] = ()):
+    """Less-or-equal constraint Lagrange multiplier."""
+    return LagrangeMultiplier(
+        init_value=init_value,
+        constraint_shape=constraint_shape,
+        constraint_type="leq",
+        parameterization="softplus"
+    )

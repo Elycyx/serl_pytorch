@@ -1,0 +1,31 @@
+# PyTorch Core
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Gym Environment
+gym>=0.26
+
+# Scientific Computing
+numpy>=1.24.3
+scipy==1.11.4
+
+# Utilities
+tqdm>=4.60.0
+absl-py>=0.12.0
+einops>=0.6.1
+
+# Logging and Visualization
+wandb>=0.12.14
+tensorboard>=2.14.0
+
+# Media Processing
+imageio>=2.31.1
+moviepy>=1.0.3
+
+# Development Tools
+pre-commit==3.3.3
+
+# Optional: For compatibility with existing code
+tensorflow>=2.16.0  # Only if needed for data loading
+tensorflow_probability>=0.24.0  # Only if needed for certain distributions
+

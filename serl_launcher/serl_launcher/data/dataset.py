@@ -1,63 +1,75 @@
 from functools import partial
 from typing import Dict, Iterable, Optional, Tuple, Union
 
-import jax
-import jax.numpy as jnp
+import torch
 import numpy as np
-from flax.core import frozen_dict
 from gym.utils import seeding
 
-DataType = Union[np.ndarray, Dict[str, "DataType"]]
+DataType = Union[np.ndarray, torch.Tensor, Dict[str, "DataType"]]
 DatasetDict = Dict[str, DataType]
 
 
 def _check_lengths(dataset_dict: DatasetDict, dataset_len: Optional[int] = None) -> int:
+    """Check that all arrays in dataset have consistent lengths."""
     for v in dataset_dict.values():
         if isinstance(v, dict):
             dataset_len = dataset_len or _check_lengths(v, dataset_len)
-        elif isinstance(v, np.ndarray):
+        elif isinstance(v, (np.ndarray, torch.Tensor)):
             item_len = len(v)
             dataset_len = dataset_len or item_len
             assert dataset_len == item_len, "Inconsistent item lengths in the dataset."
         else:
-            raise TypeError("Unsupported type.")
+            raise TypeError(f"Unsupported type: {type(v)}")
     return dataset_len
 
 
 def _subselect(dataset_dict: DatasetDict, index: np.ndarray) -> DatasetDict:
+    """Subselect elements from dataset using index array."""
     new_dataset_dict = {}
     for k, v in dataset_dict.items():
         if isinstance(v, dict):
             new_v = _subselect(v, index)
         elif isinstance(v, np.ndarray):
             new_v = v[index]
+        elif isinstance(v, torch.Tensor):
+            new_v = v[torch.from_numpy(index)]
         else:
-            raise TypeError("Unsupported type.")
+            raise TypeError(f"Unsupported type: {type(v)}")
         new_dataset_dict[k] = new_v
     return new_dataset_dict
 
 
 def _sample(
-    dataset_dict: Union[np.ndarray, DatasetDict], indx: np.ndarray
+    dataset_dict: Union[np.ndarray, torch.Tensor, DatasetDict], indx: np.ndarray
 ) -> DatasetDict:
+    """Sample elements from dataset using index array."""
     if isinstance(dataset_dict, np.ndarray):
         return dataset_dict[indx]
+    elif isinstance(dataset_dict, torch.Tensor):
+        return dataset_dict[torch.from_numpy(indx)]
     elif isinstance(dataset_dict, dict):
         batch = {}
         for k, v in dataset_dict.items():
             batch[k] = _sample(v, indx)
+        return batch
     else:
-        raise TypeError("Unsupported type.")
-    return batch
+        raise TypeError(f"Unsupported type: {type(dataset_dict)}")
 
 
 class Dataset(object):
+    """
+    Dataset class for storing and sampling transitions.
+    
+    Args:
+        dataset_dict: Dictionary containing data arrays
+        seed: Random seed for sampling
+    """
+    
     def __init__(self, dataset_dict: DatasetDict, seed: Optional[int] = None):
         self.dataset_dict = dataset_dict
         self.dataset_len = _check_lengths(dataset_dict)
 
-        # Seeding similar to OpenAI Gym:
-        # https://github.com/openai/gym/blob/master/gym/spaces/space.py#L46
+        # Seeding similar to OpenAI Gym
         self._np_random = None
         self._seed = None
         if seed is not None:
@@ -70,6 +82,7 @@ class Dataset(object):
         return self._np_random
 
     def seed(self, seed: Optional[int] = None) -> list:
+        """Seed the random number generator."""
         self._np_random, self._seed = seeding.np_random(seed)
         return [self._seed]
 
@@ -81,7 +94,18 @@ class Dataset(object):
         batch_size: int,
         keys: Optional[Iterable[str]] = None,
         indx: Optional[np.ndarray] = None,
-    ) -> frozen_dict.FrozenDict:
+    ) -> Dict:
+        """
+        Sample a batch from the dataset.
+        
+        Args:
+            batch_size: Number of samples to draw
+            keys: Specific keys to sample (None for all)
+            indx: Specific indices to use (None for random)
+            
+        Returns:
+            Dictionary of sampled data
+        """
         if indx is None:
             if hasattr(self.np_random, "integers"):
                 indx = self.np_random.integers(len(self), size=batch_size)
@@ -99,40 +123,56 @@ class Dataset(object):
             else:
                 batch[k] = self.dataset_dict[k][indx]
 
-        return frozen_dict.freeze(batch)
+        return batch
 
-    def sample_jax(self, batch_size: int, keys: Optional[Iterable[str]] = None):
-        if not hasattr(self, "rng"):
-            self.rng = jax.random.PRNGKey(self._seed or 42)
-
-            if keys is None:
-                keys = self.dataset_dict.keys()
-
-            # jax_dataset_dict = {k: self.dataset_dict[k] for k in keys}
-            # jax_dataset_dict = jax.device_put(jax_dataset_dict)
-
-            @jax.jit
-            def _sample_jax(rng, src, max_indx: int):
-                key, rng = jax.random.split(rng)
-                indx = jax.random.randint(key, (batch_size,), minval=0, maxval=max_indx)
-                return (
-                    rng,
-                    indx.max(),
-                    jax.tree_map(lambda d: jnp.take(d, indx, axis=0), src),
-                )
-
-            self._sample_jax = _sample_jax
-
-        self.rng, indx_max, sample = self._sample_jax(
-            self.rng, self.dataset_dict, len(self)
-        )
-        return indx_max, sample
+    def sample_torch(
+        self,
+        batch_size: int,
+        keys: Optional[Iterable[str]] = None,
+        device: torch.device = None,
+    ) -> Dict:
+        """
+        Sample a batch and convert to PyTorch tensors.
+        
+        Args:
+            batch_size: Number of samples to draw
+            keys: Specific keys to sample (None for all)
+            device: Device to place tensors on
+            
+        Returns:
+            Dictionary of PyTorch tensors
+        """
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Sample using numpy
+        batch = self.sample(batch_size, keys=keys)
+        
+        # Convert to torch tensors recursively
+        def to_torch(data):
+            if isinstance(data, dict):
+                return {k: to_torch(v) for k, v in data.items()}
+            elif isinstance(data, np.ndarray):
+                return torch.as_tensor(data, device=device)
+            elif isinstance(data, torch.Tensor):
+                return data.to(device)
+            else:
+                return data
+        
+        return to_torch(batch)
 
     def split(self, ratio: float) -> Tuple["Dataset", "Dataset"]:
+        """
+        Split dataset into train and test sets.
+        
+        Args:
+            ratio: Fraction of data to use for training
+            
+        Returns:
+            Tuple of (train_dataset, test_dataset)
+        """
         assert 0 < ratio and ratio < 1
-        train_index = np.index_exp[: int(self.dataset_len * ratio)]
-        test_index = np.index_exp[int(self.dataset_len * ratio) :]
-
+        
         index = np.arange(len(self), dtype=np.int32)
         self.np_random.shuffle(index)
         train_index = index[: int(self.dataset_len * ratio)]
@@ -143,6 +183,12 @@ class Dataset(object):
         return Dataset(train_dataset_dict), Dataset(test_dataset_dict)
 
     def _trajectory_boundaries_and_returns(self) -> Tuple[list, list, list]:
+        """
+        Compute episode boundaries and returns.
+        
+        Returns:
+            Tuple of (episode_starts, episode_ends, episode_returns)
+        """
         episode_starts = [0]
         episode_ends = []
 
@@ -164,6 +210,13 @@ class Dataset(object):
     def filter(
         self, take_top: Optional[float] = None, threshold: Optional[float] = None
     ):
+        """
+        Filter dataset to keep only high-return trajectories.
+        
+        Args:
+            take_top: Percentage of top trajectories to keep
+            threshold: Minimum return threshold
+        """
         assert (take_top is None and threshold is not None) or (
             take_top is not None and threshold is None
         )
@@ -184,12 +237,16 @@ class Dataset(object):
                 bool_indx[episode_starts[i] : episode_ends[i]] = True
 
         self.dataset_dict = _subselect(self.dataset_dict, bool_indx)
-
         self.dataset_len = _check_lengths(self.dataset_dict)
 
     def normalize_returns(self, scaling: float = 1000):
+        """
+        Normalize rewards based on episode returns.
+        
+        Args:
+            scaling: Scaling factor for normalized rewards
+        """
         (_, _, episode_returns) = self._trajectory_boundaries_and_returns()
-        self.dataset_dict["rewards"] /= np.max(episode_returns) - np.min(
-            episode_returns
-        )
-        self.dataset_dict["rewards"] *= scaling
+        return_range = np.max(episode_returns) - np.min(episode_returns)
+        if return_range > 0:
+            self.dataset_dict["rewards"] = self.dataset_dict["rewards"] / return_range * scaling

@@ -1,19 +1,22 @@
 """
-This file starts a control server running on the real time PC connected to the franka robot.
-In a screen run `python franka_server.py`
+Franka robot server implementation without ROS dependencies.
+This uses the Franka Python SDK (libfranka-python) for direct robot control.
+
+Installation:
+    pip install libfranka  # Or use the official Franka Python bindings
+
+Note: This is a template implementation. You'll need to install and configure
+the actual Franka Python SDK based on your robot's version and setup.
 """
-from flask import Flask, request, jsonify
+
+from typing import Dict, Optional, Tuple
 import numpy as np
-import rospy
 import time
-import subprocess
+from flask import Flask, request, jsonify
 from scipy.spatial.transform import Rotation as R
 from absl import app, flags
 
-from franka_msgs.msg import ErrorRecoveryActionGoal, FrankaState
-from serl_franka_controllers.msg import ZeroJacobian
-import geometry_msgs.msg as geom_msg
-from dynamic_reconfigure.client import Client as ReconfClient
+from serl_robot_infra.robot_servers.base_robot_server import BaseRobotServer
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
@@ -32,327 +35,407 @@ flags.DEFINE_list(
 )
 
 
-class FrankaServer:
-    """Handles the starting and stopping of the impedance controller
-    (as well as backup) joint recovery policy."""
+class FrankaServer(BaseRobotServer):
+    """
+    Franka robot control server using direct SDK communication (no ROS).
+    
+    This is a template implementation that should be completed with actual
+    Franka SDK calls based on your specific robot configuration.
+    """
 
-    def __init__(self, robot_ip, gripper_type, ros_pkg_name, reset_joint_target):
+    def __init__(self, robot_ip: str, gripper_type: str = "Robotiq", reset_joint_target: list = None, **kwargs):
+        """
+        Initialize Franka robot server.
+        
+        Args:
+            robot_ip: IP address of Franka robot controller
+            gripper_type: Type of gripper ('Robotiq', 'Franka', or None)
+            reset_joint_target: Target joint angles for reset position
+            **kwargs: Additional configuration
+        """
         self.robot_ip = robot_ip
-        self.ros_pkg_name = ros_pkg_name
-        self.reset_joint_target = reset_joint_target
         self.gripper_type = gripper_type
-
-        self.eepub = rospy.Publisher(
-            "/cartesian_impedance_controller/equilibrium_pose",
-            geom_msg.PoseStamped,
-            queue_size=10,
-        )
-        self.resetpub = rospy.Publisher(
-            "/franka_control/error_recovery/goal", ErrorRecoveryActionGoal, queue_size=1
-        )
-        self.jacobian_sub = rospy.Subscriber(
-            "/cartesian_impedance_controller/franka_jacobian",
-            ZeroJacobian,
-            self._set_jacobian,
-        )
-        self.state_sub = rospy.Subscriber(
-            "franka_state_controller/franka_states", FrankaState, self._set_currpos
-        )
-
-    def start_impedance(self):
-        """Launches the impedance controller"""
-        self.imp = subprocess.Popen(
-            [
-                "roslaunch",
-                self.ros_pkg_name,
-                "impedance.launch",
-                "robot_ip:=" + self.robot_ip,
-                f"load_gripper:={'true' if self.gripper_type == 'Franka' else 'false'}",
-            ],
-            stdout=subprocess.PIPE,
-        )
-        time.sleep(5)
-
-    def stop_impedance(self):
-        """Stops the impedance controller"""
-        self.imp.terminate()
-        time.sleep(1)
-
-    def clear(self):
-        """Clears any errors"""
-        msg = ErrorRecoveryActionGoal()
-        self.resetpub.publish(msg)
-
-    def reset_joint(self):
-        """Resets Joints (needed after running for hours)"""
-        # First Stop impedance
+        self.reset_joint_target = reset_joint_target or [0, 0, 0, -1.9, 0, 2, 0]
+        
+        # Robot state
+        self._current_joint_positions = None
+        self._current_joint_velocities = None
+        self._current_cartesian_pose = None
+        self._jacobian = None
+        self._is_connected = False
+        
+        # TODO: Initialize actual Franka robot connection here
+        # Example (pseudo-code):
+        # from franka import Robot
+        # self.robot = Robot(robot_ip)
+        
+        print(f"[FrankaServer] Initialized for robot at {robot_ip}")
+        print(f"[FrankaServer] Gripper type: {gripper_type}")
+        print("[FrankaServer] NOTE: This is a template implementation.")
+        print("[FrankaServer] Please implement actual Franka SDK calls based on your robot configuration.")
+    
+    def connect(self) -> bool:
+        """
+        Connect to the Franka robot.
+        
+        Returns:
+            True if connection successful
+        """
         try:
-            self.stop_impedance()
-            self.clear()
-        except:
-            print("impedance Not Running")
-        time.sleep(3)
-        self.clear()
-
-        # Launch joint controller reset
-        # set rosparm with rospkg
-        # rosparam set /target_joint_positions '[q1, q2, q3, q4, q5, q6, q7]'
-        rospy.set_param("/target_joint_positions", self.reset_joint_target)
-
-        self.joint_controller = subprocess.Popen(
-            [
-                "roslaunch",
-                self.ros_pkg_name,
-                "joint.launch",
-                "robot_ip:=" + self.robot_ip,
-                f"load_gripper:={'true' if self.gripper_type == 'Franka' else 'false'}",
-            ],
-            stdout=subprocess.PIPE,
-        )
-        time.sleep(1)
-        print("RUNNING JOINT RESET")
-        self.clear()
-
-        # Wait until target joint angles are reached
-        count = 0
-        time.sleep(1)
-        while not np.allclose(
-            np.array(self.reset_joint_target) - np.array(self.q),
-            0,
-            atol=1e-2,
-            rtol=1e-2,
-        ):
-            time.sleep(1)
-            count += 1
-            if count > 30:
-                print("joint reset TIMEOUT")
-                break
-
-        # Stop joint controller
-        print("RESET DONE")
-        self.joint_controller.terminate()
-        time.sleep(1)
-        self.clear()
-        print("KILLED JOINT RESET", self.pos)
-
-        # Restart impedece controller
-        self.start_impedance()
-        print("impedance STARTED")
-
-    def move(self, pose: list):
-        """Moves to a pose: [x, y, z, qx, qy, qz, qw]"""
-        assert len(pose) == 7
-        msg = geom_msg.PoseStamped()
-        msg.header.frame_id = "0"
-        msg.header.stamp = rospy.Time.now()
-        msg.pose.position = geom_msg.Point(pose[0], pose[1], pose[2])
-        msg.pose.orientation = geom_msg.Quaternion(pose[3], pose[4], pose[5], pose[6])
-        self.eepub.publish(msg)
-
-    def _set_currpos(self, msg):
-        tmatrix = np.array(list(msg.O_T_EE)).reshape(4, 4).T
-        r = R.from_matrix(tmatrix[:3, :3])
-        pose = np.concatenate([tmatrix[:3, -1], r.as_quat()])
-        self.pos = pose
-        self.dq = np.array(list(msg.dq)).reshape((7,))
-        self.q = np.array(list(msg.q)).reshape((7,))
-        self.force = np.array(list(msg.K_F_ext_hat_K)[:3])
-        self.torque = np.array(list(msg.K_F_ext_hat_K)[3:])
+            # TODO: Implement actual connection logic using Franka SDK
+            # Example (pseudo-code):
+            # self.robot.connect()
+            # self._is_connected = self.robot.is_connected()
+            
+            print("[FrankaServer] Connect called - implement actual SDK connection")
+            self._is_connected = True  # Placeholder
+            return self._is_connected
+        except Exception as e:
+            print(f"[FrankaServer] Connection failed: {e}")
+            self._is_connected = False
+            return False
+    
+    def disconnect(self) -> bool:
+        """
+        Disconnect from the Franka robot.
+        
+        Returns:
+            True if disconnection successful
+        """
         try:
-            self.vel = self.jacobian @ self.dq
-        except:
-            self.vel = np.zeros(6)
-            rospy.logwarn(
-                "Jacobian not set, end-effector velocity temporarily not available"
+            # TODO: Implement actual disconnection logic
+            # Example (pseudo-code):
+            # self.robot.disconnect()
+            
+            print("[FrankaServer] Disconnect called")
+            self._is_connected = False
+            return True
+        except Exception as e:
+            print(f"[FrankaServer] Disconnection failed: {e}")
+            return False
+    
+    def get_state(self) -> Dict[str, np.ndarray]:
+        """
+        Get current robot state.
+        
+        Returns:
+            Dictionary with joint positions, velocities, cartesian pose, etc.
+        """
+        # TODO: Implement actual state reading from Franka SDK
+        # Example (pseudo-code):
+        # state = self.robot.read_once()
+        # return {
+        #     'joint_positions': np.array(state.q),
+        #     'joint_velocities': np.array(state.dq),
+        #     'joint_torques': np.array(state.tau_J),
+        #     'cartesian_position': state.O_T_EE[:3, 3],
+        #     'cartesian_orientation': ...,
+        # }
+        
+        # Placeholder return
+        return {
+            'joint_positions': self._current_joint_positions or np.zeros(7),
+            'joint_velocities': self._current_joint_velocities or np.zeros(7),
+            'joint_torques': np.zeros(7),
+            'cartesian_position': np.zeros(3),
+            'cartesian_orientation': np.array([0, 0, 0, 1]),  # quaternion
+        }
+    
+    def move_to_joint_positions(
+        self,
+        positions: np.ndarray,
+        velocity: Optional[float] = None,
+        acceleration: Optional[float] = None,
+        blocking: bool = True,
+    ) -> bool:
+        """
+        Move to target joint positions.
+        
+        Args:
+            positions: Target joint positions (7 values for Franka)
+            velocity: Maximum velocity
+            acceleration: Maximum acceleration
+            blocking: Whether to wait for completion
+            
+        Returns:
+            True if successful
+        """
+        try:
+            # TODO: Implement actual joint motion using Franka SDK
+            # Example (pseudo-code):
+            # motion_generator = JointMotion(positions, velocity, acceleration)
+            # self.robot.control(motion_generator)
+            
+            print(f"[FrankaServer] Moving to joint positions: {positions}")
+            self._current_joint_positions = positions
+            return True
+        except Exception as e:
+            print(f"[FrankaServer] Joint motion failed: {e}")
+            return False
+    
+    def move_to_cartesian_pose(
+        self,
+        position: np.ndarray,
+        orientation: np.ndarray,
+        velocity: Optional[float] = None,
+        acceleration: Optional[float] = None,
+        blocking: bool = True,
+    ) -> bool:
+        """
+        Move to target Cartesian pose.
+        
+        Args:
+            position: Target position [x, y, z]
+            orientation: Target orientation (quaternion [qx, qy, qz, qw])
+            velocity: Maximum velocity
+            acceleration: Maximum acceleration
+            blocking: Whether to wait for completion
+            
+        Returns:
+            True if successful
+        """
+        try:
+            # TODO: Implement actual Cartesian motion using Franka SDK
+            # Example (pseudo-code):
+            # pose = create_pose_matrix(position, orientation)
+            # motion_generator = CartesianMotion(pose, velocity, acceleration)
+            # self.robot.control(motion_generator)
+            
+            print(f"[FrankaServer] Moving to Cartesian pose: pos={position}, ori={orientation}")
+            return True
+        except Exception as e:
+            print(f"[FrankaServer] Cartesian motion failed: {e}")
+            return False
+    
+    def send_joint_command(
+        self,
+        command: np.ndarray,
+        command_type: str = 'position',
+    ) -> bool:
+        """
+        Send low-level joint command.
+        
+        Args:
+            command: Joint command values
+            command_type: 'position', 'velocity', or 'torque'
+            
+        Returns:
+            True if successful
+        """
+        try:
+            # TODO: Implement actual command sending using Franka SDK
+            # Example (pseudo-code):
+            # if command_type == 'position':
+            #     self.robot.set_joint_positions(command)
+            # elif command_type == 'torque':
+            #     self.robot.set_joint_torques(command)
+            
+            print(f"[FrankaServer] Sending {command_type} command: {command}")
+            return True
+        except Exception as e:
+            print(f"[FrankaServer] Command failed: {e}")
+            return False
+    
+    def send_cartesian_command(
+        self,
+        position: np.ndarray,
+        orientation: Optional[np.ndarray] = None,
+    ) -> bool:
+        """
+        Send Cartesian space command (for impedance control).
+        
+        Args:
+            position: Target position
+            orientation: Target orientation (if None, keep current)
+            
+        Returns:
+            True if successful
+        """
+        try:
+            # TODO: Implement Cartesian impedance control command
+            # This typically involves setting equilibrium pose for impedance controller
+            
+            print(f"[FrankaServer] Sending Cartesian command: {position}")
+            return True
+        except Exception as e:
+            print(f"[FrankaServer] Cartesian command failed: {e}")
+            return False
+    
+    def reset(self) -> bool:
+        """
+        Reset robot to home position.
+        
+        Returns:
+            True if successful
+        """
+        try:
+            # Move to reset joint configuration
+            return self.move_to_joint_positions(
+                np.array(self.reset_joint_target),
+                blocking=True
             )
+        except Exception as e:
+            print(f"[FrankaServer] Reset failed: {e}")
+            return False
+    
+    def stop(self) -> bool:
+        """
+        Emergency stop.
+        
+        Returns:
+            True if successful
+        """
+        try:
+            # TODO: Implement emergency stop using Franka SDK
+            # Example (pseudo-code):
+            # self.robot.stop()
+            
+            print("[FrankaServer] Emergency stop called")
+            return True
+        except Exception as e:
+            print(f"[FrankaServer] Stop failed: {e}")
+            return False
+    
+    def is_connected(self) -> bool:
+        """
+        Check if connected to robot.
+        
+        Returns:
+            True if connected
+        """
+        return self._is_connected
+    
+    def get_joint_limits(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get Franka joint limits.
+        
+        Returns:
+            Tuple of (lower_limits, upper_limits)
+        """
+        # Franka Panda joint limits (radians)
+        lower = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+        upper = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
+        return lower, upper
+    
+    def get_workspace_limits(self) -> Dict[str, np.ndarray]:
+        """
+        Get approximate workspace limits for Franka.
+        
+        Returns:
+            Dictionary with position min/max
+        """
+        return {
+            'position_min': np.array([0.3, -0.5, 0.0]),
+            'position_max': np.array([0.8, 0.5, 0.6]),
+        }
+    
+    def get_jacobian(self) -> Optional[np.ndarray]:
+        """
+        Get current Jacobian matrix.
+        
+        Returns:
+            6x7 Jacobian matrix
+        """
+        # TODO: Implement Jacobian retrieval from Franka SDK
+        # The Franka provides this directly from the robot state
+        return self._jacobian
+    
+    def error_recovery(self) -> bool:
+        """
+        Perform error recovery (Franka-specific).
+        
+        Returns:
+            True if successful
+        """
+        try:
+            # TODO: Implement error recovery using Franka SDK
+            # Example (pseudo-code):
+            # self.robot.automatic_error_recovery()
+            
+            print("[FrankaServer] Error recovery called")
+            return True
+        except Exception as e:
+            print(f"[FrankaServer] Error recovery failed: {e}")
+            return False
 
-    def _set_jacobian(self, msg):
-        jacobian = np.array(list(msg.zero_jacobian)).reshape((6, 7), order="F")
-        self.jacobian = jacobian
 
-
-###############################################################################
-
-
-def main(_):
-    ROS_PKG_NAME = "serl_franka_controllers"
-
-    ROBOT_IP = FLAGS.robot_ip
-    GRIPPER_IP = FLAGS.gripper_ip
-    GRIPPER_TYPE = FLAGS.gripper_type
-    RESET_JOINT_TARGET = FLAGS.reset_joint_target
-
-    webapp = Flask(__name__)
-
-    try:
-        roscore = subprocess.Popen("roscore")
-        time.sleep(1)
-    except Exception as e:
-        raise Exception("roscore not running", e)
-
-    # Start ros node
-    rospy.init_node("franka_control_api")
-
-    if GRIPPER_TYPE == "Robotiq":
-        from robot_servers.robotiq_gripper_server import RobotiqGripperServer
-
-        gripper_server = RobotiqGripperServer(gripper_ip=GRIPPER_IP)
-    elif GRIPPER_TYPE == "Franka":
-        from robot_servers.franka_gripper_server import FrankaGripperServer
-
-        gripper_server = FrankaGripperServer()
-    elif GRIPPER_TYPE == "None":
-        pass
-    else:
-        raise NotImplementedError("Gripper Type Not Implemented")
-
-    """Starts impedance controller"""
-    robot_server = FrankaServer(
-        robot_ip=ROBOT_IP,
-        gripper_type=GRIPPER_TYPE,
-        ros_pkg_name=ROS_PKG_NAME,
-        reset_joint_target=RESET_JOINT_TARGET,
-    )
-    robot_server.start_impedance()
-
-    reconf_client = ReconfClient(
-        "cartesian_impedance_controllerdynamic_reconfigure_compliance_param_node"
-    )
-
-    # Route for Starting impedance
-    @webapp.route("/startimp", methods=["POST"])
-    def start_impedance():
-        robot_server.clear()
-        robot_server.start_impedance()
-        return "Started impedance"
-
-    # Route for Stopping impedance
-    @webapp.route("/stopimp", methods=["POST"])
-    def stop_impedance():
-        robot_server.stop_impedance()
-        return "Stopped impedance"
-
-    # Route for Getting Pose
-    @webapp.route("/getpos", methods=["POST"])
-    def get_pos():
-        return jsonify({"pose": np.array(robot_server.pos).tolist()})
-
-    @webapp.route("/getpos_euler", methods=["POST"])
-    def get_pos_euler():
-        r = R.from_quat(robot_server.pos[3:])
-        euler = r.as_euler("xyz")
-        return jsonify({"pose": np.concatenate([robot_server.pos[:3], euler]).tolist()})
-
-    @webapp.route("/getvel", methods=["POST"])
-    def get_vel():
-        return jsonify({"vel": np.array(robot_server.vel).tolist()})
-
-    @webapp.route("/getforce", methods=["POST"])
-    def get_force():
-        return jsonify({"force": np.array(robot_server.force).tolist()})
-
-    @webapp.route("/gettorque", methods=["POST"])
-    def get_torque():
-        return jsonify({"torque": np.array(robot_server.torque).tolist()})
-
-    @webapp.route("/getq", methods=["POST"])
-    def get_q():
-        return jsonify({"q": np.array(robot_server.q).tolist()})
-
-    @webapp.route("/getdq", methods=["POST"])
-    def get_dq():
-        return jsonify({"dq": np.array(robot_server.dq).tolist()})
-
-    @webapp.route("/getjacobian", methods=["POST"])
-    def get_jacobian():
-        return jsonify({"jacobian": np.array(robot_server.jacobian).tolist()})
-
-    # Route for getting gripper distance
-    @webapp.route("/get_gripper", methods=["POST"])
-    def get_gripper():
-        return jsonify({"gripper": gripper_server.gripper_pos})
-
-    # Route for Running Joint Reset
-    @webapp.route("/jointreset", methods=["POST"])
-    def joint_reset():
-        robot_server.clear()
-        robot_server.reset_joint()
-        return "Reset Joint"
-
-    # Route for Activating the Gripper
-    @webapp.route("/activate_gripper", methods=["POST"])
-    def activate_gripper():
-        print("activate gripper")
-        gripper_server.activate_gripper()
-        return "Activated"
-
-    # Route for Resetting the Gripper. It will reset and activate the gripper
-    @webapp.route("/reset_gripper", methods=["POST"])
-    def reset_gripper():
-        print("reset gripper")
-        gripper_server.reset_gripper()
-        return "Reset"
-
-    # Route for Opening the Gripper
-    @webapp.route("/open_gripper", methods=["POST"])
-    def open():
-        print("open")
-        gripper_server.open()
-        return "Opened"
-
-    # Route for Closing the Gripper
-    @webapp.route("/close_gripper", methods=["POST"])
-    def close():
-        print("close")
-        gripper_server.close()
-        return "Closed"
-
-    # Route for moving the gripper
-    @webapp.route("/move_gripper", methods=["POST"])
-    def move_gripper():
-        gripper_pos = request.json
-        pos = np.clip(int(gripper_pos["gripper_pos"]), 0, 255)  # 0-255
-        print(f"move gripper to {pos}")
-        gripper_server.move(pos)
-        return "Moved Gripper"
-
-    # Route for Clearing Errors (Communcation constraints, etc.)
-    @webapp.route("/clearerr", methods=["POST"])
-    def clear():
-        robot_server.clear()
-        return "Clear"
-
-    # Route for Sending a pose command
-    @webapp.route("/pose", methods=["POST"])
-    def pose():
-        pos = np.array(request.json["arr"])
-        print("Moving to", pos)
-        robot_server.move(pos)
-        return "Moved"
-
-    # Route for getting all state information
-    @webapp.route("/getstate", methods=["POST"])
+def create_app(franka_server: FrankaServer):
+    """
+    Create Flask app for HTTP API to robot server.
+    
+    Args:
+        franka_server: Franka server instance
+        
+    Returns:
+        Flask app
+    """
+    app = Flask(__name__)
+    
+    @app.route('/get_state', methods=['GET'])
     def get_state():
-        return jsonify(
-            {
-                "pose": np.array(robot_server.pos).tolist(),
-                "vel": np.array(robot_server.vel).tolist(),
-                "force": np.array(robot_server.force).tolist(),
-                "torque": np.array(robot_server.torque).tolist(),
-                "q": np.array(robot_server.q).tolist(),
-                "dq": np.array(robot_server.dq).tolist(),
-                "jacobian": np.array(robot_server.jacobian).tolist(),
-                "gripper_pos": gripper_server.gripper_pos,
-            }
+        state = franka_server.get_state()
+        # Convert numpy arrays to lists for JSON serialization
+        state_json = {k: v.tolist() if isinstance(v, np.ndarray) else v 
+                     for k, v in state.items()}
+        return jsonify(state_json)
+    
+    @app.route('/move_to_joint_positions', methods=['POST'])
+    def move_to_joint_positions():
+        data = request.json
+        positions = np.array(data['positions'])
+        success = franka_server.move_to_joint_positions(
+            positions,
+            velocity=data.get('velocity'),
+            acceleration=data.get('acceleration'),
+            blocking=data.get('blocking', True),
         )
+        return jsonify({'success': success})
+    
+    @app.route('/send_cartesian_command', methods=['POST'])
+    def send_cartesian_command():
+        data = request.json
+        position = np.array(data['position'])
+        orientation = np.array(data['orientation']) if 'orientation' in data else None
+        success = franka_server.send_cartesian_command(position, orientation)
+        return jsonify({'success': success})
+    
+    @app.route('/reset', methods=['POST'])
+    def reset():
+        success = franka_server.reset()
+        return jsonify({'success': success})
+    
+    @app.route('/stop', methods=['POST'])
+    def stop():
+        success = franka_server.stop()
+        return jsonify({'success': success})
+    
+    @app.route('/error_recovery', methods=['POST'])
+    def error_recovery():
+        success = franka_server.error_recovery()
+        return jsonify({'success': success})
+    
+    return app
 
-    # Route for updating compliance parameters
-    @webapp.route("/update_param", methods=["POST"])
-    def update_param():
-        reconf_client.update_configuration(request.json)
-        return "Updated compliance parameters"
 
-    webapp.run(host="0.0.0.0")
+def main(argv):
+    # Create Franka server
+    franka_server = FrankaServer(
+        robot_ip=FLAGS.robot_ip,
+        gripper_type=FLAGS.gripper_type,
+        reset_joint_target=[float(x) for x in FLAGS.reset_joint_target],
+    )
+    
+    # Connect to robot
+    if franka_server.connect():
+        print("[FrankaServer] Successfully connected to robot")
+    else:
+        print("[FrankaServer] Failed to connect to robot")
+        return
+    
+    # Create and run Flask app
+    flask_app = create_app(franka_server)
+    print("[FrankaServer] Starting HTTP server on port 5000")
+    flask_app.run(host='0.0.0.0', port=5000)
 
 
 if __name__ == "__main__":
